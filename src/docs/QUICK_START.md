@@ -7,7 +7,7 @@ Train your first model in 5 minutes.
 ```bash
 # 1. Activate environment
 conda activate fusion_train_cu126
-cd /home/hoang.pm/reorganized
+cd /home/hoangpm/LW-Fish-Feeding/src
 
 # 2. Preprocess video and audio (run once)
 python data/preprocessing/video_preprocessing.py \
@@ -383,7 +383,7 @@ data:
 ### Import Errors
 ```bash
 # Make sure you're in the right directory
-cd /home/hoang.pm/reorganized
+cd /home/hoangpm/LW-Fish-Feeding/src
 
 # Make sure environment is activated
 conda activate fusion_train_cu126
