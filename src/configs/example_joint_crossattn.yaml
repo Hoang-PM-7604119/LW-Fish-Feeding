@@ -1,0 +1,92 @@
+# Example configuration for Joint Cross-Attention fusion model
+# S3D video encoder + PANN CNN10 audio encoder
+
+model:
+  # Video encoder configuration
+  video_encoder:
+    type: s3d
+    output_dim: 1024
+    pretrained_path: /mnt/disk1/backup_user/hoang.pm/pretrained_models/video/S3D_kinetics400.pth
+  
+  # Audio encoder configuration  
+  audio_encoder:
+    type: pann_cnn10
+    output_dim: 512
+    sample_rate: 32000
+    pretrained_path: /mnt/disk1/backup_user/hoang.pm/pretrained_models/audio/Cnn10_mAP=0.380.pth
+  
+  # Fusion configuration
+  fusion:
+    type: joint_cross_attention
+    embed_dim: 512
+    num_heads: 8
+    num_layers: 2
+    dropout: 0.1
+    use_residual: true
+  
+  # Classifier configuration
+  classifier:
+    num_classes: 4
+    dropout: 0.3
+
+# Data configuration
+data:
+  video_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_video  # Preprocessed video (.pkl files)
+  audio_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_audio
+  
+  # Fixed splits for fair comparison (RECOMMENDED)
+  # Create splits first: python scripts/create_fixed_splits.py --video_dir ./data/processed_video --audio_dir ./data/audio_dataset --output_dir ./data/splits
+  split_file: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/splits/splits.json  # Set to null for dynamic splitting
+  
+  # Dynamic splitting parameters (only used if split_file is null or not found)
+  seed: 42
+  test_sample_per_class: 700  # Samples per class for test/val splits
+  
+  batch_size: 32
+  num_workers: 4
+  audio_duration: 2.0  # Audio duration in seconds
+  sample_rate: 32000   # Audio sample rate
+  class_names: ['none', 'weak', 'medium', 'strong']
+
+# Training configuration
+training:
+  epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  
+  # Mixed precision training
+  mixed_precision: true
+  
+  # Checkpoint configuration (saves best and last only)
+  checkpoint_dir: ./checkpoints/joint_crossattn_s3d_cnn10
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.001
+
+# Logging configuration
+logging:
+  use_wandb: true
+  wandb_project: fusion_experiments
+  wandb_entity: null  # Set to your wandb username/team
+  log_every: 10
+  save_attention: true
+  
+# Evaluation configuration  
+evaluation:
+  test_batch_size: 64
+  save_predictions: true
+  save_confusion_matrix: true
+
+# Hardware configuration
+hardware:
+  device: cuda
+  gpu_id: 0
+  deterministic: true
+  seed: 42

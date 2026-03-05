@@ -1,0 +1,59 @@
+# Audio-Only Model - EfficientNet-B0
+
+model:
+  modality: audio
+  audio_encoder:
+    type: efficientnet
+    output_dim: 1280
+    sample_rate: 32000
+    kwargs:
+      variant: b0
+      n_mels: 64
+      pretrained: true
+  classifier:
+    num_classes: 4
+    dropout: 0.3
+
+data:
+  video_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_video
+  audio_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_audio
+  split_file: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/splits/splits.json
+  seed: 42
+  test_sample_per_class: 700
+  batch_size: 32
+  num_workers: 4
+  audio_duration: 2.0
+  sample_rate: 32000
+  class_names: ['none', 'weak', 'medium', 'strong']
+
+training:
+  epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  mixed_precision: true
+  checkpoint_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/checkpoints/audio_efficientnet
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.001
+
+logging:
+  use_wandb: true
+  wandb_project: fish_audio_comprehensive
+  wandb_entity: null
+  log_every: 10
+
+evaluation:
+  test_batch_size: 64
+  save_predictions: true
+  save_confusion_matrix: true
+
+hardware:
+  device: cuda
+  gpu_id: 0
+  deterministic: true
+  seed: 42

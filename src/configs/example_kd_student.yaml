@@ -1,0 +1,95 @@
+# Example configuration for Knowledge Distillation
+# Student: MoViNet-A0 + MobileNet V2
+# Teacher: S3D + PANN CNN10
+
+model:
+  # Student model configuration
+  student:
+    video_encoder:
+      type: movinet
+      variant: a0
+      output_dim: 512
+      pretrained: true
+    
+    audio_encoder:
+      type: mobilenet
+      output_dim: 256
+      pretrained: true
+    
+    fusion:
+      type: cross_attention
+      embed_dim: 512
+      num_heads: 8
+      dropout: 0.1
+    
+    classifier:
+      num_classes: 4
+      dropout: 0.3
+  
+  # Teacher model configuration
+  teacher:
+    checkpoint_path: ./checkpoints/teacher_best.pth
+    freeze: true
+
+# Knowledge distillation configuration
+knowledge_distillation:
+  mode: offline  # 'online' or 'offline'
+  soft_labels_dir: ./data/soft_labels  # For offline mode
+  temperature: 4.0
+  alpha: 0.3  # Weight for KD loss (1-alpha for CE loss)
+  feature_weight: 0.1  # Weight for feature matching
+  
+  # Feature matching layers
+  match_features: true
+  feature_layers: ['video', 'audio', 'fusion']
+
+# Data configuration
+data:
+  video_dir: ./data/processed_video  # Preprocessed video (.pkl files)
+  audio_dir: ./data/audio_dataset    # Raw audio (.wav files)
+  
+  # Fixed splits for fair comparison (RECOMMENDED)
+  # Create splits first: python scripts/create_fixed_splits.py --video_dir ./data/processed_video --audio_dir ./data/audio_dataset --output_dir ./data/splits
+  split_file: ./data/splits/splits.json  # Set to null for dynamic splitting
+  
+  # Dynamic splitting parameters (only used if split_file is null or not found)
+  seed: 42
+  test_sample_per_class: 700  # Samples per class for test/val splits
+  
+  batch_size: 64  # Larger batch size for offline KD
+  num_workers: 4
+  audio_duration: 2.0  # Audio duration in seconds
+  sample_rate: 32000   # Audio sample rate
+  class_names: ['none', 'weak', 'medium', 'strong']
+
+# Training configuration
+training:
+  epochs: 150
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip: 1.0
+  
+  mixed_precision: true
+  
+  # Checkpoint configuration (saves best and last only)
+  checkpoint_dir: ./checkpoints/kd_movinet_mobilenet
+  
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.001
+
+# Logging configuration
+logging:
+  use_wandb: true
+  wandb_project: fusion_kd
+  log_every: 10
+
+# Hardware configuration
+hardware:
+  device: cuda
+  gpu_id: 0
+  seed: 42

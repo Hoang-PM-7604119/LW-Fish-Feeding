@@ -1,0 +1,52 @@
+name: fusion_train_cu126
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python
+  - python=3.11
+  
+  # Scientific computing (conda)
+  - numpy=1.26.4
+  - scipy
+  - pandas
+  - scikit-learn
+  
+  # Visualization
+  - matplotlib
+  - seaborn
+  
+  # Configuration
+  - pyyaml
+  
+  # Progress bars
+  - tqdm
+  
+  # Pip packages
+  - pip
+  - pip:
+      # PyTorch with CUDA 12.1 (from PyTorch index)
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+      - torchvision==0.20.1+cu121
+      - torchaudio==2.5.1+cu121
+      
+      # Audio processing
+      - librosa==0.11.0
+      - soundfile==0.13.1
+      - torchlibrosa==0.1.0
+      
+      # Computer vision
+      - opencv-python==4.12.0.88
+      - pillow==11.3.0
+      
+      # Experiment tracking
+      - wandb==0.24.1
+      - tensorboard==2.20.0
+      
+      # Model complexity analysis
+      - thop>=0.1.1
+      - ptflops>=0.7.0
+      
+      # Utilities
+      - einops==0.8.1
