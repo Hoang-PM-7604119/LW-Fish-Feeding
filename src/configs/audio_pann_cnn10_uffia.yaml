@@ -1,0 +1,74 @@
+# Audio-Only Model - PANN CNN10 with U-FFIA-style preprocessing
+# (ZeroPad2d time pad, BN on mel, SpecAugment during training)
+
+model:
+  modality: audio
+  audio_encoder:
+    type: pann_cnn10
+    output_dim: 512
+    sample_rate: 64000
+    # pretrained_path: /mnt/disk1/backup_user/hoang.pm/pretrained_models/Cnn10_mAP=0.380.pth
+    pretrained_path: /home/hoang.pm/hoang/reorganized/pretrained/Cnn10.pth
+    kwargs:
+      window_size: 2048
+      hop_size: 1024
+      mel_bins: 64
+      fmin: 1
+      fmax: 128000
+      # U-FFIA style: preprocessing + single linear classifier (fc_audioset)
+      use_uffia_frontend: true
+      use_uffia_style: true
+      time_pad: 2
+      spec_augment: true
+      time_drop_width: 64
+      time_stripes_num: 2
+      freq_drop_width: 8
+      freq_stripes_num: 2
+  classifier:
+    num_classes: 4
+    dropout: 0.3
+
+data:
+  video_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_video
+  audio_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/processed_audio
+  split_file: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/splits/splits.json
+  seed: 42
+  test_sample_per_class: 700
+  batch_size: 32
+  num_workers: 4
+  audio_duration: 2.0
+  sample_rate: 64000
+  class_names: ['none', 'weak', 'medium', 'strong']
+
+training:
+  epochs: 200
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  mixed_precision: true
+  checkpoint_dir: /mnt/disk1/backup_user/hoang.pm/UFFIA_data/fixed/checkpoints/audio_pann_cnn10_uffia
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_delta: 0.001
+
+logging:
+  use_wandb: true
+  wandb_project: Multimodalities for Aquaculture
+  wandb_entity: null   # set to your username/team to see runs under that entity
+  wandb_mode: online   # use 'online' so runs appear on dashboard (default)
+  log_every: 10       # log train/batch_loss every N batches for live dashboard
+
+evaluation:
+  test_batch_size: 64
+  save_predictions: true
+  save_confusion_matrix: true
+
+hardware:
+  device: cuda
+  gpu_id: 0
+  deterministic: true
+  seed: 42

@@ -2,6 +2,8 @@
 Local PANN (Pretrained Audio Neural Network) reimplementation.
 No dependency on U-FFIA or torchlibrosa. Uses torchaudio for mel spectrogram.
 Compatible with audioset_tagging_cnn checkpoint keys for Cnn10/Cnn14.
+
+U-FFIA-style preprocessing: optional frontend with ZeroPad2d, BN on mel, SpecAugment.
 """
 
 import torch
@@ -19,6 +21,58 @@ def _init_layer(layer):
 def _init_bn(bn):
     bn.bias.data.fill_(0.0)
     bn.weight.data.fill_(1.0)
+
+
+class SpecAugmentation(nn.Module):
+    """
+    SpecAugment: time and frequency masking (U-FFIA style).
+    Defaults: time_drop_width=64, time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2.
+    Input: (B, 1, time, freq). Applied only when model.training is True.
+    """
+
+    def __init__(
+        self,
+        time_drop_width: int = 64,
+        time_stripes_num: int = 2,
+        freq_drop_width: int = 8,
+        freq_stripes_num: int = 2,
+    ):
+        super().__init__()
+        self.time_drop_width = time_drop_width
+        self.time_stripes_num = time_stripes_num
+        self.freq_drop_width = freq_drop_width
+        self.freq_stripes_num = freq_stripes_num
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, 1, T, F). Returns same shape with random time/freq stripes zeroed.
+        """
+        if not self.training or x.size(0) == 0:
+            return x
+        B, C, T, F = x.shape
+        out = x.clone()
+        device = x.device
+        # Time masking: mask along dim 2 (time)
+        for _ in range(self.time_stripes_num):
+            w = min(self.time_drop_width, T)
+            if w <= 0:
+                break
+            t0 = torch.randint(0, max(1, T - w + 1), (B,), device=device)
+            for b in range(B):
+                t1 = min(t0[b].item() + w, T)
+                t0b = t0[b].item()
+                out[b, :, t0b:t1, :] = 0.0
+        # Frequency masking: mask along dim 3 (freq)
+        for _ in range(self.freq_stripes_num):
+            w = min(self.freq_drop_width, F)
+            if w <= 0:
+                break
+            f0 = torch.randint(0, max(1, F - w + 1), (B,), device=device)
+            for b in range(B):
+                f1 = min(f0[b].item() + w, F)
+                f0b = f0[b].item()
+                out[b, :, :, f0b:f1] = 0.0
+        return out
 
 
 class ConvBlock(nn.Module):
@@ -82,6 +136,78 @@ class LogMelFrontend(nn.Module):
         return x.unsqueeze(1)
 
 
+class UFFIALogMelFrontend(nn.Module):
+    """
+    U-FFIA-style preprocessing: Spectrogram -> LogMel (ref=1, amin=1e-10),
+    ZeroPad2d to expand time (e.g. +2 frames), BatchNorm on mel bins, SpecAugment in training.
+    Output shape: (B, 1, mel_bins, time) to match Cnn10Backbone/Cnn14Backbone.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 32000,
+        window_size: int = 1024,
+        hop_size: int = 320,
+        mel_bins: int = 64,
+        fmin: int = 50,
+        fmax: int = 14000,
+        time_pad: int = 2,
+        spec_augment: bool = True,
+        time_drop_width: int = 64,
+        time_stripes_num: int = 2,
+        freq_drop_width: int = 8,
+        freq_stripes_num: int = 2,
+    ):
+        super().__init__()
+        self.mel_bins = mel_bins
+        self.time_pad = time_pad
+        self.spec_augment = spec_augment
+        # Hann window, power=2, then log with amin (U-FFIA ref=1.0, amin=1e-10)
+        self.melspec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=window_size,
+            hop_length=hop_size,
+            win_length=window_size,
+            window_fn=torch.hann_window,
+            f_min=float(fmin),
+            f_max=float(fmax),
+            n_mels=mel_bins,
+            power=2.0,
+        )
+        # BN over (time, 1) per mel channel, i.e. BatchNorm2d(mel_bins)
+        self.bn0 = nn.BatchNorm2d(mel_bins)
+        _init_bn(self.bn0)
+        if spec_augment:
+            self.spec_augmenter = SpecAugmentation(
+                time_drop_width=time_drop_width,
+                time_stripes_num=time_stripes_num,
+                freq_drop_width=freq_drop_width,
+                freq_stripes_num=freq_stripes_num,
+            )
+        else:
+            self.spec_augmenter = None
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        # (B, mel_bins, time)
+        x = self.melspec(wav)
+        x = torch.clamp(x, min=1e-10).log()
+        # (B, 1, mel_bins, time)
+        x = x.unsqueeze(1)
+        # Pad time: +time_pad at start (U-FFIA "expand 126 to 128")
+        if self.time_pad > 0:
+            x = F.pad(x, (self.time_pad, 0), mode="constant", value=0.0)
+        # BN: (B, 1, mel_bins, T) -> (B, mel_bins, T, 1) -> bn0 -> (B, 1, mel_bins, T)
+        x = x.permute(0, 2, 3, 1)  # (B, mel_bins, T, 1)
+        x = self.bn0(x)
+        x = x.permute(0, 3, 1, 2)  # (B, 1, mel_bins, T)
+        # SpecAugment (U-FFIA applies on (B, 1, T, F); we have (B, 1, mel_bins, T))
+        if self.spec_augmenter is not None and self.training:
+            x = x.permute(0, 1, 3, 2)  # (B, 1, T, mel_bins)
+            x = self.spec_augmenter(x)
+            x = x.permute(0, 1, 3, 2)  # (B, 1, mel_bins, T)
+        return x
+
+
 class Cnn10Backbone(nn.Module):
     """Cnn10 backbone. Expects input [B, 1, mel_bins, time]. Output [B, 512]."""
 
@@ -101,7 +227,12 @@ class Cnn10Backbone(nn.Module):
         _init_layer(self.fc1)
         _init_layer(self.fc_audioset)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_logits: bool = False):
+        """
+        Args:
+            x: input mel [B, 1, mel_bins, time]
+            return_logits: if True, return (embedding, logits) for U-FFIA-style single linear head
+        """
         x = x.transpose(2, 3)
         x = x.permute(0, 3, 2, 1)
         x = self.bn0(x)
@@ -121,6 +252,8 @@ class Cnn10Backbone(nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu_(self.fc1(x))
         embedding = F.dropout(x, p=0.5, training=self.training)
+        if return_logits:
+            return embedding, self.fc_audioset(x)  # U-FFIA: fc_audioset on pre-dropout x
         return embedding
 
 
@@ -145,7 +278,7 @@ class Cnn14Backbone(nn.Module):
         _init_layer(self.fc1)
         _init_layer(self.fc_audioset)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_logits: bool = False):
         x = x.transpose(2, 3)
         x = x.permute(0, 3, 2, 1)
         x = self.bn0(x)
@@ -169,4 +302,6 @@ class Cnn14Backbone(nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu_(self.fc1(x))
         embedding = F.dropout(x, p=0.5, training=self.training)
+        if return_logits:
+            return embedding, self.fc_audioset(x)  # U-FFIA: fc_audioset on pre-dropout x
         return embedding

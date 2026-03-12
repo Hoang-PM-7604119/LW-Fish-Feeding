@@ -81,32 +81,47 @@ class VideoOnlyModel(nn.Module):
 
 
 class AudioOnlyModel(nn.Module):
-    """Audio-only classification model."""
+    """Audio-only classification model. Supports U-FFIA style (encoder outputs logits directly)."""
     
     def __init__(self, config):
         super().__init__()
         
+        ae_config = config['model']['audio_encoder']
+        kwargs = ae_config.get('kwargs', {}).copy()
+        self.use_uffia_style = kwargs.pop('use_uffia_style', False)
+        if self.use_uffia_style:
+            kwargs['classes_num'] = config['model']['classifier']['num_classes']
+        kwargs['use_uffia_style'] = self.use_uffia_style
+        
+        # Resolve pretrained_path relative to project root so loading works from any cwd
+        pretrained_path = ae_config.get('pretrained_path')
+        if pretrained_path and not os.path.isabs(pretrained_path):
+            project_root = Path(__file__).resolve().parent.parent
+            pretrained_path = str(project_root / pretrained_path)
+        
         # Audio encoder
         self.audio_encoder = get_audio_encoder(
-            encoder_type=config['model']['audio_encoder']['type'],
-            output_dim=config['model']['audio_encoder']['output_dim'],
-            sample_rate=config['model']['audio_encoder'].get('sample_rate', 32000),
-            pretrained_path=config['model']['audio_encoder'].get('pretrained_path'),
-            **config['model']['audio_encoder'].get('kwargs', {})
+            encoder_type=ae_config['type'],
+            output_dim=ae_config['output_dim'],
+            sample_rate=ae_config.get('sample_rate', 32000),
+            pretrained_path=pretrained_path,
+            **kwargs
         )
         
-        # Classifier
-        embed_dim = config['model']['audio_encoder']['output_dim']
-        num_classes = config['model']['classifier']['num_classes']
-        dropout = config['model']['classifier']['dropout']
-        
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim // 2, num_classes)
-        )
+        # Classifier: U-FFIA style uses encoder's fc_audioset (no extra classifier)
+        if self.use_uffia_style:
+            self.classifier = None
+        else:
+            embed_dim = ae_config['output_dim']
+            num_classes = config['model']['classifier']['num_classes']
+            dropout = config['model']['classifier']['dropout']
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim // 2, num_classes)
+            )
     
     def forward(self, audio):
         """
@@ -118,63 +133,67 @@ class AudioOnlyModel(nn.Module):
         Returns:
             logits: Classification logits [B, num_classes]
         """
-        a_feat = self.audio_encoder(audio)  # [B, 1, D] or [B, D]
-        
-        # Ensure correct shape for classifier
-        if a_feat.dim() == 3:
-            a_feat = a_feat.squeeze(1)  # [B, D]
-        
-        logits = self.classifier(a_feat)
-        return logits
+        out = self.audio_encoder(audio)
+        if self.use_uffia_style:
+            return out  # [B, num_classes]
+        if out.dim() == 3:
+            out = out.squeeze(1)
+        return self.classifier(out)
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, modality, epoch):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, criterion, optimizer, device, modality, epoch,
+                wandb_logger=None, log_every=10, global_step=0):
+    """Train for one epoch. Optionally log batch loss to WandB for live dashboard."""
     model.train()
     loss_meter = AverageMeter()
-    
+
     all_preds = []
     all_labels = []
-    
+
     from tqdm import tqdm
-    
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1} [Train]")
     for batch_idx, batch in enumerate(pbar):
         video = batch['video'].to(device)
         audio = batch['audio'].to(device)
         labels = batch['label'].to(device)
-        
+
         # Forward pass
         optimizer.zero_grad()
-        
+
         if modality == 'video':
             logits = model(video)
         elif modality == 'audio':
             logits = model(audio)
         else:
             raise ValueError(f"Unknown modality: {modality}")
-        
+
         loss = criterion(logits, labels)
-        
+
         # Backward pass
         loss.backward()
         optimizer.step()
-        
+
         # Track metrics
         loss_meter.update(loss.item(), video.size(0))
-        
+        global_step += 1
+
+        # Log batch loss to WandB so training process is visible on dashboard
+        if wandb_logger and (batch_idx + 1) % log_every == 0:
+            wandb_logger.log_metrics({'train/batch_loss': loss_meter.avg}, step=global_step)
+
         preds = logits.argmax(dim=1).cpu().numpy()
         all_preds.extend(preds)
         all_labels.extend(labels.cpu().numpy())
-        
+
         # Update progress bar
         pbar.set_postfix({'loss': loss_meter.avg})
-    
+
     # Calculate metrics
     metrics = calculate_metrics(np.array(all_labels), np.array(all_preds))
     metrics['loss'] = loss_meter.avg
-    
-    return metrics
+
+    return metrics, global_step
 
 
 def validate(model, dataloader, criterion, device, modality):
@@ -372,14 +391,16 @@ def main():
     
     criterion = nn.CrossEntropyLoss()
     
-    # Initialize WandB
+    # Initialize WandB (online mode so runs appear on dashboard)
     wandb_logger = None
     if config['logging']['use_wandb']:
         wandb_logger = init_wandb(
             project=config['logging']['wandb_project'],
             name=f"{modality}_only_{config['model'][f'{modality}_encoder']['type']}",
             config=config,
-            tags=[modality, 'single_modality']
+            entity=config['logging'].get('wandb_entity'),
+            tags=[modality, 'single_modality'],
+            mode=config['logging'].get('wandb_mode', 'online'),
         )
     
     # Training loop
@@ -391,22 +412,28 @@ def main():
     patience_counter = 0
     checkpoint_dir = Path(config['training']['checkpoint_dir'])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    log_every = config['logging'].get('log_every', 10)
+    global_step = 0
+
     for epoch in range(config['training']['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['training']['epochs']}")
         print(f"{'-'*80}")
-        
-        # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, modality, epoch)
+
+        # Train (batch-level loss is logged inside train_epoch when wandb_logger is set)
+        train_metrics, global_step = train_epoch(
+            model, train_loader, criterion, optimizer, device, modality, epoch,
+            wandb_logger=wandb_logger, log_every=log_every, global_step=global_step
+        )
         print(f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}, "
               f"F1: {train_metrics['f1']:.4f}")
-        
+
         # Validate
         val_metrics = validate(model, val_loader, criterion, device, modality)
         print(f"Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f}, "
               f"F1: {val_metrics['f1']:.4f}")
-        
-        # Log metrics to WandB
+
+        # Log epoch metrics to WandB (same step scale as batch loss for one timeline)
         if wandb_logger:
             wandb_logger.log_metrics({
                 'train/loss': train_metrics['loss'],
@@ -419,8 +446,9 @@ def main():
                 'val/precision': val_metrics['precision'],
                 'val/recall': val_metrics['recall'],
                 'val/f1': val_metrics['f1'],
-                'learning_rate': optimizer.param_groups[0]['lr']
-            }, step=epoch)
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'epoch': epoch + 1,
+            }, step=global_step)
         
         # Save best model
         if val_metrics['accuracy'] > best_val_acc:

@@ -52,7 +52,11 @@ class WandBLogger:
             print("WandB logging disabled")
             return
         
-        # Initialize wandb
+        # Ensure runs sync to dashboard: use online mode unless explicitly overridden
+        if mode != 'offline' and mode != 'disabled':
+            mode = 'online'
+
+        # Initialize wandb (reinit=True so each process creates a new run that syncs)
         wandb.init(
             project=project,
             name=name,
@@ -60,10 +64,17 @@ class WandBLogger:
             entity=entity,
             tags=tags,
             notes=notes,
-            mode=mode
+            mode=mode,
+            reinit=True,
         )
-        
-        print(f"✓ WandB initialized: {wandb.run.get_url()}")
+
+        if wandb.run is not None:
+            print(f"✓ WandB run created: {wandb.run.get_url()}")
+            print(f"  Dashboard: https://wandb.ai (project: {project})")
+            if mode == 'online':
+                print("  Runs will sync to the dashboard; log in at wandb.ai if needed.")
+        else:
+            print("⚠ WandB run is None; check login: run 'wandb login' and ensure use_wandb is true.")
     
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
         """

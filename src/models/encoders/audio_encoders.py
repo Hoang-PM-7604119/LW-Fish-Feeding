@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
 
-from .pann_local import LogMelFrontend, Cnn10Backbone, Cnn14Backbone
+from .pann_local import LogMelFrontend, UFFIALogMelFrontend, Cnn10Backbone, Cnn14Backbone
 
 
 class ResNet18Encoder(nn.Module):
@@ -261,8 +261,26 @@ class EfficientNetEncoder(nn.Module):
         return feat.unsqueeze(1)
 
 
+def _build_pann_frontend(use_uffia: bool, sample_rate: int, window_size: int, hop_size: int,
+                         mel_bins: int, fmin: int, fmax: int, **kwargs):
+    """Build LogMelFrontend or UFFIALogMelFrontend from kwargs."""
+    base = dict(sample_rate=sample_rate, window_size=window_size, hop_size=hop_size,
+                mel_bins=mel_bins, fmin=fmin, fmax=fmax)
+    if use_uffia:
+        uffia_kw = {
+            "time_pad": kwargs.pop("time_pad", 2),
+            "spec_augment": kwargs.pop("spec_augment", True),
+            "time_drop_width": kwargs.pop("time_drop_width", 64),
+            "time_stripes_num": kwargs.pop("time_stripes_num", 2),
+            "freq_drop_width": kwargs.pop("freq_drop_width", 8),
+            "freq_stripes_num": kwargs.pop("freq_stripes_num", 2),
+        }
+        return UFFIALogMelFrontend(**base, **uffia_kw)
+    return LogMelFrontend(**base)
+
+
 class PANNCNN10Encoder(nn.Module):
-    """PANN CNN10 encoder (local reimplementation, no U-FFIA). Waveform -> LogMel -> Cnn10 -> [B, 1, 512]."""
+    """PANN CNN10 encoder. Waveform -> LogMel (or U-FFIA frontend) -> Cnn10 -> [B, 1, 512] or logits."""
 
     def __init__(
         self,
@@ -275,35 +293,54 @@ class PANNCNN10Encoder(nn.Module):
         fmax: int = 14000,
         classes_num: int = 527,
         pretrained_path: Optional[str] = None,
+        use_uffia_frontend: bool = False,
+        use_uffia_style: bool = False,
+        **kwargs
     ):
         super().__init__()
-        self.frontend = LogMelFrontend(
+        self.use_uffia_style = use_uffia_style
+        self.classes_num = classes_num if use_uffia_style else 527
+        self.frontend = _build_pann_frontend(
+            use_uffia=use_uffia_frontend,
             sample_rate=sample_rate, window_size=window_size, hop_size=hop_size,
             mel_bins=mel_bins, fmin=fmin, fmax=fmax,
+            **kwargs
         )
-        self.backbone = Cnn10Backbone(classes_num=classes_num)
+        self.backbone = Cnn10Backbone(classes_num=self.classes_num)
         self.output_dim = output_dim
         assert output_dim == 512
-        if pretrained_path and os.path.exists(pretrained_path):
-            self._load_pretrained(pretrained_path)
+        if pretrained_path:
+            if os.path.exists(pretrained_path):
+                self._load_pretrained(pretrained_path)
+            else:
+                print(f"⚠ Pretrained path not found (skipping load): {pretrained_path}")
+                print(f"  Resolve with: place checkpoint there or set pretrained_path to an absolute path.")
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         x = self.frontend(audio)
+        if self.use_uffia_style:
+            _, logits = self.backbone(x, return_logits=True)
+            return logits  # [B, num_classes]
         embedding = self.backbone(x)
         return embedding.unsqueeze(1)
 
     def _load_pretrained(self, checkpoint_path: str):
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
         backbone_dict = self.backbone.state_dict()
         pretrained = {k: v for k, v in state_dict.items() if k in backbone_dict and v.shape == backbone_dict[k].shape}
+        not_loaded = [k for k in backbone_dict if k not in pretrained]
         if pretrained:
             self.backbone.load_state_dict(pretrained, strict=False)
-            print(f"✓ Loaded PANN CNN10 pretrained weights from {checkpoint_path}")
+            print(f"✓ Loaded PANN CNN10 pretrained: {len(pretrained)} keys from {checkpoint_path}")
+            if not_loaded:
+                print(f"  Skipped (shape mismatch or not in checkpoint): {not_loaded}")
+        else:
+            print(f"⚠ No matching keys in checkpoint (wrong format?): {checkpoint_path}")
 
 
 class PANNCNN14Encoder(nn.Module):
-    """PANN CNN14 encoder (local reimplementation, no U-FFIA). Waveform -> LogMel -> Cnn14 -> [B, 1, 2048]."""
+    """PANN CNN14 encoder. Waveform -> LogMel (or U-FFIA frontend) -> Cnn14 -> [B, 1, 2048] or logits."""
 
     def __init__(
         self,
@@ -316,31 +353,50 @@ class PANNCNN14Encoder(nn.Module):
         fmax: int = 14000,
         classes_num: int = 527,
         pretrained_path: Optional[str] = None,
+        use_uffia_frontend: bool = False,
+        use_uffia_style: bool = False,
+        **kwargs
     ):
         super().__init__()
-        self.frontend = LogMelFrontend(
+        self.use_uffia_style = use_uffia_style
+        self.classes_num = classes_num if use_uffia_style else 527
+        self.frontend = _build_pann_frontend(
+            use_uffia=use_uffia_frontend,
             sample_rate=sample_rate, window_size=window_size, hop_size=hop_size,
             mel_bins=mel_bins, fmin=fmin, fmax=fmax,
+            **kwargs
         )
-        self.backbone = Cnn14Backbone(classes_num=classes_num)
+        self.backbone = Cnn14Backbone(classes_num=self.classes_num)
         self.output_dim = output_dim
         assert output_dim == 2048
-        if pretrained_path and os.path.exists(pretrained_path):
-            self._load_pretrained(pretrained_path)
+        if pretrained_path:
+            if os.path.exists(pretrained_path):
+                self._load_pretrained(pretrained_path)
+            else:
+                print(f"⚠ Pretrained path not found (skipping load): {pretrained_path}")
+                print(f"  Resolve with: place checkpoint there or set pretrained_path to an absolute path.")
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         x = self.frontend(audio)
+        if self.use_uffia_style:
+            _, logits = self.backbone(x, return_logits=True)
+            return logits  # [B, num_classes]
         embedding = self.backbone(x)
         return embedding.unsqueeze(1)
 
     def _load_pretrained(self, checkpoint_path: str):
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
         backbone_dict = self.backbone.state_dict()
         pretrained = {k: v for k, v in state_dict.items() if k in backbone_dict and v.shape == backbone_dict[k].shape}
+        not_loaded = [k for k in backbone_dict if k not in pretrained]
         if pretrained:
             self.backbone.load_state_dict(pretrained, strict=False)
-            print(f"✓ Loaded PANN CNN14 pretrained weights from {checkpoint_path}")
+            print(f"✓ Loaded PANN CNN14 pretrained: {len(pretrained)} keys from {checkpoint_path}")
+            if not_loaded:
+                print(f"  Skipped (shape mismatch or not in checkpoint): {not_loaded}")
+        else:
+            print(f"⚠ No matching keys in checkpoint (wrong format?): {checkpoint_path}")
 
 
 def get_audio_encoder(
