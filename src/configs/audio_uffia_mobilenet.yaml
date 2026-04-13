@@ -1,0 +1,74 @@
+# Audio-Only Model - U-FFIA-style MobileNetV2
+#
+# Redesigned audio encoder matching U-FFIA's Audio_Frontend + MobileNetV2:
+#   - STFT window 2048, hop 1024 (better frequency resolution than default 1024/320)
+#   - BatchNorm on mel bins (bn0)
+#   - SpecAugmentation during training (time + frequency masking)
+#   - MobileNetV2 backbone with 1-channel mel input
+#   - Dual aggregation: max-pool + mean-pool summed
+
+model:
+  modality: audio
+  audio_encoder:
+    type: uffia_mobilenet
+    output_dim: 512
+    sample_rate: 32000
+    window_size: 2048
+    hop_size: 1024
+    mel_bins: 64
+    fmin: 1
+    fmax: 16000
+    spec_augment: true
+    time_drop_width: 64
+    time_stripes_num: 2
+    freq_drop_width: 8
+    freq_stripes_num: 2
+    pretrained: true
+  classifier:
+    num_classes: 4
+    dropout: 0.3
+
+data:
+  video_dir: /home/icclab/UFFIA_dataset/video_dataset
+  audio_dir: /home/icclab/UFFIA_dataset/audio_dataset
+  split_file: /home/icclab/LW-Fish-Feeding/src/data/splits/splits.json
+  seed: 42
+  test_sample_per_class: 700
+  batch_size: 32
+  num_workers: 4
+  audio_duration: 2.0
+  sample_rate: 32000
+  class_names: ['none', 'weak', 'medium', 'strong']
+
+training:
+  epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  mixed_precision: true
+  checkpoint_dir: ./checkpoints/audio_uffia_mobilenet
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.001
+
+logging:
+  use_wandb: false
+  wandb_project: fish_feeding
+  wandb_entity: null
+  wandb_mode: online
+  log_every: 10
+
+evaluation:
+  test_batch_size: 64
+  save_predictions: true
+  save_confusion_matrix: true
+
+hardware:
+  device: cuda
+  gpu_id: 0
+  deterministic: true
+  seed: 42

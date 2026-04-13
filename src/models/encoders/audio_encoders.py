@@ -399,6 +399,96 @@ class PANNCNN14Encoder(nn.Module):
             print(f"⚠ No matching keys in checkpoint (wrong format?): {checkpoint_path}")
 
 
+class UFFIAMobileNetAudioEncoder(nn.Module):
+    """
+    U-FFIA-style audio encoder: MobileNetV2 backbone with UFFIA frontend.
+
+    Redesigned to match U-FFIA's Audio_Frontend + MobileNetV2 design:
+    - Larger STFT window (2048) for better frequency resolution
+    - BatchNorm on mel bins (bn0 in U-FFIA)
+    - SpecAugmentation during training (time + frequency masking)
+    - MobileNetV2 backbone with single-channel mel-spectrogram input
+    - Dual aggregation: max-pool + mean-pool over time/frequency, then sum
+    - Output: [B, 1, output_dim]
+
+    Compared to the plain MobileNetV2Encoder this adds:
+      * Proper BN-normalized mel frontend instead of raw MelSpectrogram
+      * SpecAugmentation regularisation
+      * Dual (max+avg) pooling instead of global avg-pool only
+    """
+
+    def __init__(
+        self,
+        output_dim: int = 512,
+        sample_rate: int = 32000,
+        window_size: int = 2048,
+        hop_size: int = 1024,
+        mel_bins: int = 64,
+        fmin: int = 1,
+        fmax: int = 16000,
+        spec_augment: bool = True,
+        time_drop_width: int = 64,
+        time_stripes_num: int = 2,
+        freq_drop_width: int = 8,
+        freq_stripes_num: int = 2,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+
+        # U-FFIA-style frontend: mel → BN → SpecAugment
+        self.frontend = UFFIALogMelFrontend(
+            sample_rate=sample_rate,
+            window_size=window_size,
+            hop_size=hop_size,
+            mel_bins=mel_bins,
+            fmin=fmin,
+            fmax=fmax,
+            spec_augment=spec_augment,
+            time_drop_width=time_drop_width,
+            time_stripes_num=time_stripes_num,
+            freq_drop_width=freq_drop_width,
+            freq_stripes_num=freq_stripes_num,
+        )
+
+        # MobileNetV2 backbone — replace first conv for 1-channel mel input
+        mobilenet = tv_models.mobilenet_v2(pretrained=pretrained)
+        orig_conv = mobilenet.features[0][0]
+        mobilenet.features[0][0] = nn.Conv2d(
+            1, orig_conv.out_channels,
+            kernel_size=orig_conv.kernel_size,
+            stride=orig_conv.stride,
+            padding=orig_conv.padding,
+            bias=False,
+        )
+        self.backbone = mobilenet.features  # [B, 1280, H', W']
+
+        backbone_dim = 1280
+        self.proj = nn.Linear(backbone_dim, output_dim)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            audio: Waveform [B, n_samples]
+        Returns:
+            features: [B, 1, output_dim]
+        """
+        x = self.frontend(audio)          # [B, 1, mel_bins, time]
+        x = self.backbone(x)              # [B, 1280, H', W']
+
+        # Dual pooling: max + mean (U-FFIA aggregation)
+        x_max = F.adaptive_max_pool2d(x, 1).flatten(1)   # [B, 1280]
+        x_avg = F.adaptive_avg_pool2d(x, 1).flatten(1)   # [B, 1280]
+        x = x_max + x_avg                                 # [B, 1280]
+
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.proj(x)                  # [B, output_dim]
+
+        return x.unsqueeze(1)             # [B, 1, output_dim]
+
+
 def get_audio_encoder(
     encoder_type: str,
     output_dim: int = 512,
@@ -428,7 +518,7 @@ def get_audio_encoder(
     pann_types = ['pann_cnn10', 'cnn10', 'pann_cnn14', 'cnn14']
     if encoder_type not in pann_types:
         kwargs.pop("pretrained_path", None)
-    
+
     if encoder_type == 'resnet18':
         return ResNet18Encoder(output_dim=output_dim, **kwargs)
     elif encoder_type == 'resnet50':
@@ -441,10 +531,13 @@ def get_audio_encoder(
         return PANNCNN10Encoder(output_dim=output_dim, **kwargs)
     elif encoder_type in ['pann_cnn14', 'cnn14']:
         return PANNCNN14Encoder(output_dim=output_dim, **kwargs)
+    elif encoder_type in ['uffia_mobilenet', 'uffia_mobilenetv2']:
+        return UFFIAMobileNetAudioEncoder(output_dim=output_dim, **kwargs)
     else:
         raise ValueError(
             f"Unknown audio encoder type: {encoder_type}. "
-            f"Available: resnet18, resnet50, mobilenet, efficientnet, pann_cnn10, pann_cnn14"
+            f"Available: resnet18, resnet50, mobilenet, efficientnet, "
+            f"pann_cnn10, pann_cnn14, uffia_mobilenet"
         )
 
 

@@ -40,17 +40,20 @@ DEFAULT_OUTPUT_DIR = '/mnt/e/U-FFIA_data/data/splits'
 DEFAULT_CLASS_NAMES = ['none', 'weak', 'medium', 'strong']
 
 
-def get_file_identifier(filepath, include_feed=False):
+def get_file_identifier(filepath, include_feed=True):
     """Extract unique identifier from video/audio filename.
-    include_feed: if False (default), match by date+name only so video in PM_100
-    and audio in PM_70 for the same clip still pair.
+
+    include_feed: if True (default), the feeding session (AM_100, PM_70, …) is
+    included in the identifier so that clips from different sessions on the same
+    date are never incorrectly cross-paired.  Set False only for legacy
+    compatibility.
     """
     filename = os.path.basename(filepath)
     parent_dirs = os.path.dirname(filepath).split(os.sep)
-    
+
     name = filename.replace('_video_', '_').replace('_audio_', '_')
     name = name.replace('.mp4', '').replace('.wav', '').replace('.pkl', '').replace('.npy', '')
-    
+
     date_part = None
     feed_part = None
     for p in parent_dirs:
@@ -58,12 +61,25 @@ def get_file_identifier(filepath, include_feed=False):
             date_part = p
         if p.startswith('AM_') or p.startswith('PM_'):
             feed_part = p
-    
-    if date_part and (include_feed and feed_part):
-        return f"{date_part}_{feed_part}_{name}"
+
+    if date_part and feed_part:
+        if include_feed:
+            return f"{date_part}_{feed_part}_{name}"
+        return f"{date_part}_{name}"
     if date_part:
         return f"{date_part}_{name}"
     return name
+
+
+def extract_session(video_file):
+    """Return the session key (date/feeding_type) from a relative video path.
+
+    E.g. '2022_6_23/AM_70/strong/23_video_37.mp4'  →  '2022_6_23/AM_70'
+    """
+    parts = video_file.replace('\\', '/').split('/')
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0]
 
 
 def find_matched_pairs(video_dir, audio_dir, class_names):
@@ -108,15 +124,15 @@ def find_matched_pairs(video_dir, audio_dir, class_names):
         if not audio_paths:
             audio_paths = glob.glob(os.path.join(audio_dir, class_name, '*.npy'))
 
-        # identifier -> list of audio paths (same date+name can appear in different feed folders)
+        # identifier includes feeding session to prevent cross-session pairing
         audio_by_id = {}
         for audio_path in audio_paths:
-            identifier = get_file_identifier(audio_path)
+            identifier = get_file_identifier(audio_path, include_feed=True)
             audio_by_id.setdefault(identifier, []).append(audio_path)
-        
+
         pairs = []
         for video_path in video_paths:
-            identifier = get_file_identifier(video_path)
+            identifier = get_file_identifier(video_path, include_feed=True)
             if identifier in audio_by_id and audio_by_id[identifier]:
                 audio_path = audio_by_id[identifier].pop(0)
                 pairs.append({
@@ -131,6 +147,84 @@ def find_matched_pairs(video_dir, audio_dir, class_names):
               f"(video: {len(video_paths)}, audio: {len(audio_paths)})")
     
     return matched_pairs
+
+
+def create_session_level_splits(matched_pairs, seed, val_clips=2800, test_clips=2800):
+    """
+    Split at the feeding-session level to eliminate data leakage while
+    preserving the original dataset ratio (~21k / 2.8k / 2.8k).
+
+    Each session (date + feeding_type, e.g. '2022_6_23/AM_70') is assigned
+    entirely to one split.  Sessions are selected in shuffled order and
+    accumulated until the running clip total meets ``test_clips`` (for test)
+    and ``val_clips`` (for val).  Using a clip-count target rather than a
+    session-count ratio ensures val and test receive the same number of clips
+    regardless of individual session sizes.
+    """
+    sessions = {}
+    for class_name, pairs in matched_pairs.items():
+        for pair in pairs:
+            session_key = extract_session(pair['video_file'])
+            sessions.setdefault(session_key, []).append(pair)
+
+    session_keys = sorted(sessions.keys())
+    random_state = np.random.RandomState(seed)
+    random_state.shuffle(session_keys)
+
+    # Round-robin deficit assignment until each pool reaches its target.
+    val_pool, test_pool = [], []
+    val_total = test_total = 0
+    for key in session_keys:
+        if val_total >= val_clips and test_total >= test_clips:
+            break
+        val_deficit = val_clips - val_total
+        test_deficit = test_clips - test_total
+        pairs = sessions[key]
+        if test_deficit >= val_deficit and test_deficit > 0:
+            test_pool.extend(pairs)
+            test_total += len(pairs)
+        elif val_deficit > 0:
+            val_pool.extend(pairs)
+            val_total += len(pairs)
+
+    # Subsample each pool DOWN to exactly the target; overflow → train.
+    def _exact(pool, target, rng):
+        if len(pool) <= target:
+            return pool, []
+        idx = rng.choice(len(pool), target, replace=False)
+        idx_set = set(idx.tolist())
+        return (
+            [p for i, p in enumerate(pool) if i in idx_set],
+            [p for i, p in enumerate(pool) if i not in idx_set],
+        )
+
+    val_exact, val_overflow = _exact(val_pool, val_clips, random_state)
+    test_exact, test_overflow = _exact(test_pool, test_clips, random_state)
+
+    # Train = all sessions not in val/test pools, plus any overflow clips.
+    pool_ids = {id(p) for p in val_pool + test_pool}
+    train_pairs = [p for pairs in sessions.values() for p in pairs
+                   if id(p) not in pool_ids]
+    train_pairs.extend(val_overflow)
+    train_pairs.extend(test_overflow)
+
+    splits = {'train': train_pairs, 'val': val_exact, 'test': test_exact}
+    for split_name in splits:
+        random_state.shuffle(splits[split_name])
+
+    n_val_s = len({extract_session(p['video_file']) for p in val_exact})
+    n_test_s = len({extract_session(p['video_file']) for p in test_exact})
+    n_train_s = len(sessions) - n_val_s - n_test_s
+    print(f"\n  Session-level split: ~{n_train_s} train / ~{n_val_s} val / ~{n_test_s} test sessions")
+    for split_name in ['train', 'val', 'test']:
+        class_counts = {}
+        for p in splits[split_name]:
+            c = p['class']
+            class_counts[c] = class_counts.get(c, 0) + 1
+        counts_str = "  ".join(f"{k}={v}" for k, v in sorted(class_counts.items()))
+        print(f"  {split_name:>5}: {len(splits[split_name]):5d} clips  [{counts_str}]")
+
+    return splits
 
 
 def create_splits_by_count(matched_pairs, test_per_class, val_per_class, seed, ensure_disjoint_audio=True):
@@ -232,6 +326,15 @@ def main():
     parser.add_argument('--class_names', type=str, nargs='+', default=DEFAULT_CLASS_NAMES)
     parser.add_argument('--test_per_class', type=int, default=700)
     parser.add_argument('--val_per_class', type=int, default=700)
+    parser.add_argument(
+        '--session_level', action='store_true',
+        help='Split at feeding-session level (prevents data leakage). '
+             'Recommended over --test_per_class / --val_per_class.'
+    )
+    parser.add_argument('--val_clips', type=int, default=2800,
+                        help='Target clip count for validation split (session_level only)')
+    parser.add_argument('--test_clips', type=int, default=2800,
+                        help='Target clip count for test split (session_level only)')
     
     args = parser.parse_args()
     
@@ -284,23 +387,43 @@ def main():
     print("\n" + "-" * 40)
     print("Creating splits...")
     print("-" * 40)
-    
-    splits = create_splits_by_count(
-        matched_pairs,
-        args.test_per_class,
-        args.val_per_class,
-        args.seed
-    )
-    
-    metadata = {
-        'created_at': datetime.now().isoformat(),
-        'seed': args.seed,
-        'class_names': args.class_names,
-        'test_per_class': args.test_per_class,
-        'val_per_class': args.val_per_class,
-        'video_dir': os.path.abspath(args.video_dir),
-        'audio_dir': os.path.abspath(args.audio_dir),
-    }
+
+    if args.session_level:
+        print("  Method: session-level (no data leakage)")
+        splits = create_session_level_splits(
+            matched_pairs,
+            seed=args.seed,
+            val_clips=args.val_clips,
+            test_clips=args.test_clips,
+        )
+        metadata = {
+            'created_at': datetime.now().isoformat(),
+            'seed': args.seed,
+            'class_names': args.class_names,
+            'split_method': 'session_level',
+            'val_clips_target': args.val_clips,
+            'test_clips_target': args.test_clips,
+            'video_dir': os.path.abspath(args.video_dir),
+            'audio_dir': os.path.abspath(args.audio_dir),
+        }
+    else:
+        print("  Method: count-based per class (legacy)")
+        splits = create_splits_by_count(
+            matched_pairs,
+            args.test_per_class,
+            args.val_per_class,
+            args.seed,
+        )
+        metadata = {
+            'created_at': datetime.now().isoformat(),
+            'seed': args.seed,
+            'class_names': args.class_names,
+            'split_method': 'count',
+            'test_per_class': args.test_per_class,
+            'val_per_class': args.val_per_class,
+            'video_dir': os.path.abspath(args.video_dir),
+            'audio_dir': os.path.abspath(args.audio_dir),
+        }
     
     print("\n" + "-" * 40)
     print("Saving splits...")

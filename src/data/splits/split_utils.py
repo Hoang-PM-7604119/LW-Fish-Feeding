@@ -169,6 +169,111 @@ def find_matched_pairs(video_dir: str, audio_dir: str, class_names: List[str]) -
     return matched_pairs
 
 
+def _extract_session(video_file: str) -> str:
+    """Return session key (date/feeding_type) from a relative video file path."""
+    parts = video_file.replace('\\', '/').split('/')
+    return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else parts[0]
+
+
+def create_session_level_splits(
+    matched_pairs: Dict[str, List[Dict[str, str]]],
+    seed: int,
+    val_target: int = 2800,
+    test_target: int = 2800,
+) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Split data at the feeding-session level to prevent data leakage and
+    produce EXACTLY ``val_target`` and ``test_target`` clips.
+
+    Algorithm
+    ---------
+    1. Group all clips by session (date + feeding type).
+    2. Shuffle sessions with ``seed``.
+    3. Greedily accumulate sessions into val and test (round-robin by deficit)
+       until each pool reaches its target clip count.
+    4. Subsample each pool DOWN to exactly the target.  Any overflow clips
+       are moved to train so the total is preserved.
+    5. Shuffle each final split.
+
+    The only leakage risk is at the single "boundary" session for each eval
+    split where a few clips may end up in train while the rest are in val/test.
+    This is strictly minimal compared to clip-level random splitting.
+    """
+    sessions: Dict[str, List] = {}
+    for class_name, pairs in matched_pairs.items():
+        for pair in pairs:
+            key = _extract_session(pair['video_file'])
+            sessions.setdefault(key, []).append(pair)
+
+    session_keys = sorted(sessions.keys())
+    rng = np.random.RandomState(seed)
+    rng.shuffle(session_keys)
+
+    # Round-robin deficit assignment: whichever split is furthest below its
+    # target gets the next session.
+    val_pool: List = []
+    test_pool: List = []
+    val_total = test_total = 0
+
+    for key in session_keys:
+        if val_total >= val_target and test_total >= test_target:
+            break
+        val_deficit = val_target - val_total
+        test_deficit = test_target - test_total
+        pairs = sessions[key]
+        if test_deficit >= val_deficit and test_deficit > 0:
+            test_pool.extend(pairs)
+            test_total += len(pairs)
+        elif val_deficit > 0:
+            val_pool.extend(pairs)
+            val_total += len(pairs)
+
+    # Subsample each pool to exactly the target; overflow → train
+    def _exact(pool, target):
+        if len(pool) <= target:
+            return pool, []
+        idx = rng.choice(len(pool), target, replace=False)
+        idx_set = set(idx.tolist())
+        return (
+            [p for i, p in enumerate(pool) if i in idx_set],
+            [p for i, p in enumerate(pool) if i not in idx_set],
+        )
+
+    val_exact, val_overflow = _exact(val_pool, val_target)
+    test_exact, test_overflow = _exact(test_pool, test_target)
+
+    # Build final splits
+    train_pairs: List = []
+    for key, pairs in sessions.items():
+        pool_keys = {id(p) for p in val_pool + test_pool}
+        if not any(id(p) in pool_keys for p in pairs):
+            train_pairs.extend(pairs)
+    train_pairs.extend(val_overflow)
+    train_pairs.extend(test_overflow)
+
+    splits: Dict[str, List] = {
+        'train': train_pairs,
+        'val': val_exact,
+        'test': test_exact,
+    }
+    for split_name in splits:
+        rng.shuffle(splits[split_name])
+
+    n_val_s = len({_extract_session(p['video_file']) for p in val_exact})
+    n_test_s = len({_extract_session(p['video_file']) for p in test_exact})
+    n_train_s = len(sessions) - n_val_s - n_test_s
+    print(f"\n  Session-level split: ~{n_train_s} train / ~{n_val_s} val / ~{n_test_s} test sessions")
+    for split_name in ['train', 'val', 'test']:
+        class_counts: Dict[str, int] = {}
+        for p in splits[split_name]:
+            c = p['class']
+            class_counts[c] = class_counts.get(c, 0) + 1
+        counts_str = "  ".join(f"{k}={v}" for k, v in sorted(class_counts.items()))
+        print(f"  {split_name:>5}: {len(splits[split_name]):5d} clips  [{counts_str}]")
+
+    return splits
+
+
 def create_splits_by_count(
     matched_pairs: Dict[str, List[Dict[str, str]]],
     test_per_class: int,

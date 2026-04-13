@@ -170,23 +170,46 @@ def find_all_files(base_dir, class_name, extension):
     return list(set(all_paths))
 
 
+def _resolve_path(base_dir: str, rel_path: str, prefer_ext: str) -> str:
+    """Return the preprocessed path if it exists, otherwise the raw path.
+
+    For a split entry like ``2022_6_23/AM_70/strong/23_video_37.mp4``:
+    - If ``base_dir/2022_6_23/AM_70/strong/23_video_37.<prefer_ext>`` exists,
+      return that (preprocessed version).
+    - Otherwise return ``base_dir/<rel_path>`` (raw version).
+    """
+    preprocessed = os.path.join(
+        base_dir,
+        os.path.splitext(rel_path)[0] + '.' + prefer_ext.lstrip('.')
+    )
+    if os.path.exists(preprocessed):
+        return preprocessed
+    return os.path.join(base_dir, rel_path)
+
+
 def load_fixed_splits(split_file, video_dir, audio_dir):
-    """Load fixed splits from JSON file."""
+    """Load fixed splits from JSON file.
+
+    Automatically uses preprocessed .pkl / .npy files when they exist in
+    *video_dir* / *audio_dir* alongside (or instead of) the raw .mp4 / .wav
+    files.  This allows the same splits.json to work with both raw and
+    preprocessed data without any changes.
+    """
     with open(split_file, 'r') as f:
         split_data = json.load(f)
-    
+
     label_map = {'none': 0, 'weak': 1, 'medium': 2, 'strong': 3}
-    
+
     splits = {'train': [], 'val': [], 'test': []}
-    
+
     for split_name in ['train', 'val', 'test']:
         items = split_data['splits'][split_name]
         for item in items:
-            video_path = os.path.join(video_dir, item['video_file'])
-            audio_path = os.path.join(audio_dir, item['audio_file'])
+            video_path = _resolve_path(video_dir, item['video_file'], 'pkl')
+            audio_path = _resolve_path(audio_dir, item['audio_file'], 'npy')
             label = label_map[item['class']]
             splits[split_name].append([(video_path, audio_path), label])
-    
+
     return splits
 
 
